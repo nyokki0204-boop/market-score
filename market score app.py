@@ -4,6 +4,9 @@ import plotly.graph_objects as go
 from supabase import create_client
 from datetime import date
 import json
+from datetime import datetime
+from zoneinfo import ZoneInfo
+from html import escape
 
 # ── PAGE CONFIG ──
 st.set_page_config(
@@ -16,6 +19,17 @@ st.set_page_config(
 # ── CUSTOM CSS ──
 st.markdown("""
 <style>
+  .stApp { background: #0b1220; color: #e8edf5; }
+  .block-container { max-width: 780px; padding-top: 2rem; }
+  [data-testid='stCaptionContainer'] { color: #b4c0d2 !important; }
+  .indicator-heading { display:flex; flex-wrap:wrap; gap:12px; justify-content:space-between; font-size:16px; }
+  [data-testid='stVerticalBlockBorderWrapper'] { border-radius:14px; }
+  [role='radiogroup'] { display:flex; gap:8px; flex-wrap:wrap; }
+  [role='radiogroup'] label { padding:10px 12px; border:1px solid #344158; border-radius:10px; min-height:44px; }
+  .score-track { position:relative; height:8px; margin:24px 10px 12px; border-radius:8px; background:linear-gradient(to right,#ff4d6a 0% 20%,#ff9a4d 20% 40%,#f5c842 40% 60%,#7ee0b0 60% 80%,#00e5a0 80%); }
+  .score-track span { position:absolute; width:4px; height:20px; top:-6px; background:white; transform:translateX(-50%); border-radius:4px; }
+  [class^='hist-chip-'] { display:inline-block; margin-bottom:8px; }
+  @media(max-width:600px) { .block-container { padding:1rem; } .score-big { font-size:52px !important; } }
   @import url('https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&display=swap');
   
   .main { background: #0a0c0f; }
@@ -100,9 +114,11 @@ st.markdown("""
 SUPABASE_URL = st.secrets["supabase_url"]
 SUPABASE_KEY = st.secrets["supabase_key"]
 
-@st.cache_resource
 def get_client():
-    return create_client(SUPABASE_URL, SUPABASE_KEY)
+    # Auth state must never be shared between browser sessions.
+    if "sb_client" not in st.session_state:
+        st.session_state["sb_client"] = create_client(SUPABASE_URL, SUPABASE_KEY)
+    return st.session_state["sb_client"]
 
 sb = get_client()
 
@@ -117,6 +133,21 @@ INDICATORS = [
 ]
 
 DIR_LABELS = {"up": "↑", "flat": "→", "down": "↓"}
+
+def today_jst():
+    return datetime.now(ZoneInfo("Asia/Tokyo")).date()
+
+def current_dirs():
+    return {ind["key"]: {"↑": "up", "→": "flat", "↓": "down"}[
+        st.session_state.get(f"radio_{ind['key']}", "→")
+    ] for ind in INDICATORS}
+
+def impact(ind, direction):
+    if direction == "flat":
+        return "中立 · 0", "#a7b4c9", "flat"
+    if direction == ind["good"]:
+        return "追い風 · +1", "#00e5a0", "up"
+    return "逆風 · −1", "#ff4d6a", "down"
 
 def calc_score(dirs):
     n = len(INDICATORS)
@@ -158,11 +189,13 @@ def load_history():
         )
         data = sb.table("market_scores")\
             .select("*")\
+            .eq("user_id", st.session_state["user"].id)\
             .order("date", desc=True)\
             .execute()
         return data.data or []
-    except:
-        return []
+    except Exception:
+        st.error("履歴を取得できませんでした。通信状態やログイン状態を確認してください。")
+        return None
 
 def save_score(dirs, score, note):
     try:
@@ -170,9 +203,10 @@ def save_score(dirs, score, note):
             st.session_state["session"].access_token,
             st.session_state["session"].refresh_token
         )
-        today = str(date.today())
+        today = str(today_jst())
         sb.table("market_scores").upsert({
             "date": today,
+            "user_id": st.session_state["user"].id,
             "score": score,
             "dirs": dirs,
             "note": note,
@@ -188,9 +222,10 @@ def delete_score(row_id):
             st.session_state["session"].access_token,
             st.session_state["session"].refresh_token
         )
-        sb.table("market_scores").delete().eq("id", row_id).execute()
+        sb.table("market_scores").delete().eq("id", row_id).eq("user_id", st.session_state["user"].id).execute()
         return True
-    except:
+    except Exception:
+        st.error("削除できませんでした。再度お試しください。")
         return False
 
 # ── MAIN APP ──
@@ -203,11 +238,11 @@ def main_app():
     with col2:
         if st.button("ログアウト", key="logout"):
             sb.auth.sign_out()
-            del st.session_state["user"]
-            del st.session_state["session"]
+            st.session_state.clear()
             st.rerun()
 
     tab1, tab2 = st.tabs(["📝 スコア入力", "📈 履歴"])
+    history = load_history()
 
     # ── TAB 1: INPUT ──
     with tab1:
@@ -215,9 +250,13 @@ def main_app():
         if "dirs" not in st.session_state:
             st.session_state["dirs"] = {ind["key"]: "flat" for ind in INDICATORS}
 
-        dirs = st.session_state["dirs"]
+        # Widget state is updated before this rerun: calculate before rendering.
+        dirs = current_dirs()
         score = calc_score(dirs)
         regime = get_regime(score)
+        jp_name = {"RISK-ON": "強い追い風", "CONSTRUCTIVE": "やや追い風", "NEUTRAL": "中立", "CAUTIOUS": "やや逆風", "RISK-OFF": "強い逆風"}[regime["name"]]
+        previous = next((r for r in (history or []) if r["date"] < str(today_jst())), None)
+        delta_text = f"前回記録比 {score - previous['score']:+d} 点（{previous['date']}）" if previous else "前回記録なし"
 
         # Score gauge
         st.markdown(f"""
@@ -225,10 +264,14 @@ def main_app():
           <div class='regime-label'>CURRENT REGIME</div>
           <div class='score-big' style='color:{regime["color"]}'>{score}</div>
           <div style='font-family:monospace;font-size:11px;color:#5a6275;margin:4px 0'>/ 100</div>
-          <div class='regime-name' style='color:{regime["color"]}'>{regime["name"]}</div>
-          <div class='regime-desc'>{regime["desc"]}</div>
+          <div class='regime-name' style='color:{regime["color"]}'>{jp_name}</div>
+          <div class='regime-desc'>{regime["name"]} · {delta_text}</div>
+          <div class='score-track'><span style='left:{score}%'></span></div>
+          <div class='regime-desc'>0 逆風 ⟷ 100 追い風</div>
         </div>
         """, unsafe_allow_html=True)
+        counts = [sum(impact(i, dirs[i["key"]])[2] == kind for i in INDICATORS) for kind in ["up", "flat", "down"]]
+        st.caption(f"追い風 {counts[0]} ｜ 中立 {counts[1]} ｜ 逆風 {counts[2]}　·　手動評価 / 日本時間")
 
         # Indicators
         st.markdown('<div class="section-title">指標評価 — 直近の方向性</div>', unsafe_allow_html=True)
@@ -238,36 +281,30 @@ def main_app():
             contrib = dirs.get(ind["key"], "flat")
             contrib_str = "+1" if contrib == ind["good"] and contrib != "flat" else ("−1" if contrib != "flat" else "0")
 
-            c1, c2, c3 = st.columns([3, 2, 1])
-            with c1:
-                st.markdown(f"""<div style='padding:8px 0'>
-                  <span style='font-family:monospace;font-size:13px;font-weight:700;color:#e8eaf0'>{ind["name"]}</span>
-                  <span style='font-family:monospace;font-size:11px;color:#00e5a0;margin-left:6px'>{ind["ticker"]}</span><br>
-                  <span style='font-size:11px;color:#5a6275'>{ind["desc"]} · <span style="color:#00e5a0">{good_arrow}</span></span>
-                </div>""", unsafe_allow_html=True)
-            with c2:
-                direction = st.radio(
-                    label=ind["key"],
+            with st.container(border=True):
+                label, color, _ = impact(ind, dirs[ind["key"]])
+                st.markdown(f"<div class='indicator-heading'><strong>{ind['name']}</strong><span style='color:{color}'>{label}</span></div>", unsafe_allow_html=True)
+                st.caption(f"{ind['ticker']} · {good_arrow}")
+                st.radio(
+                    label=ind["name"],
                     options=["↑", "→", "↓"],
                     index=["↑", "→", "↓"].index(DIR_LABELS[dirs.get(ind["key"], "flat")]),
                     horizontal=True,
                     key=f"radio_{ind['key']}",
                     label_visibility="collapsed"
+                    , format_func=lambda value: {"↑": "↑ 上昇", "→": "→ 横ばい", "↓": "↓ 下落"}[value]
                 )
-                # Map back to key
-                dir_map = {"↑": "up", "→": "flat", "↓": "down"}
-                st.session_state["dirs"][ind["key"]] = dir_map[direction]
-            with c3:
-                color = "#00e5a0" if contrib_str == "+1" else ("#ff4d6a" if contrib_str == "−1" else "#5a6275")
-                st.markdown(f"<div style='text-align:center;font-family:monospace;font-size:14px;font-weight:700;color:{color};padding-top:10px'>{contrib_str}</div>", unsafe_allow_html=True)
-
-            st.divider()
+                with st.expander("評価の説明"):
+                    st.write(ind["desc"])
 
         # Note
         st.markdown('<div class="section-title">メモ（任意）</div>', unsafe_allow_html=True)
         note = st.text_input("", placeholder="FOMC前の様子見、CPI受けてリスクオン...", key="note_input", label_visibility="collapsed")
 
-        if st.button("この環境を記録する →", key="save_btn"):
+        saved = next((r for r in (history or []) if r["date"] == str(today_jst())), None)
+        unchanged = saved is not None and saved.get("dirs") == dirs and saved.get("note", "") == note
+        st.caption("保存済み・変更なし" if unchanged else "未保存の入力があります。同日の記録は上書きされます。")
+        if st.button("本日の評価を保存 →", key="save_btn", disabled=history is None):
             # Re-read dirs from session state
             final_dirs = {}
             for ind in INDICATORS:
@@ -275,14 +312,16 @@ def main_app():
                 final_dirs[ind["key"]] = {"↑": "up", "→": "flat", "↓": "down"}[radio_val]
             final_score = calc_score(final_dirs)
             if save_score(final_dirs, final_score, note):
-                st.success(f"{date.today()} のスコア {final_score} を保存しました ✓")
-                st.cache_data.clear()
+                st.session_state["save_notice"] = f"{today_jst()} のスコア {final_score} を保存しました ✓"
+                st.rerun()
+        if "save_notice" in st.session_state:
+            st.success(st.session_state.pop("save_notice"))
 
     # ── TAB 2: HISTORY ──
     with tab2:
-        history = load_history()
-
-        if not history:
+        if history is None:
+            st.warning("履歴の読み込みに失敗しています。記録なしとは異なります。")
+        elif not history:
             st.info("まだ記録がありません")
         else:
             # Chart
@@ -313,18 +352,18 @@ def main_app():
             st.plotly_chart(fig, use_container_width=True)
 
             # Weekly / Monthly win rates
-            df["week"]  = pd.to_datetime(df["date"]).dt.strftime("%Y-W%V")
+            df["week"]  = pd.to_datetime(df["date"]).dt.strftime("%G-W%V")
             df["month"] = pd.to_datetime(df["date"]).dt.strftime("%Y-%m")
 
             col1, col2 = st.columns(2)
             with col1:
-                st.markdown('<div class="section-title">週ごとの勝率</div>', unsafe_allow_html=True)
+                st.markdown('<div class="section-title">週ごとの平均スコア</div>', unsafe_allow_html=True)
                 wk = df.groupby("week")["score"].agg(["mean","count"]).reset_index()
                 wk.columns = ["週", "平均スコア", "件数"]
                 wk["平均スコア"] = wk["平均スコア"].round(0).astype(int)
                 st.dataframe(wk, hide_index=True, use_container_width=True)
             with col2:
-                st.markdown('<div class="section-title">月ごとの勝率</div>', unsafe_allow_html=True)
+                st.markdown('<div class="section-title">月ごとの平均スコア</div>', unsafe_allow_html=True)
                 mo = df.groupby("month")["score"].agg(["mean","count"]).reset_index()
                 mo.columns = ["月", "平均スコア", "件数"]
                 mo["平均スコア"] = mo["平均スコア"].round(0).astype(int)
@@ -339,13 +378,13 @@ def main_app():
                 for ind in INDICATORS:
                     d = dirs.get(ind["key"], "flat")
                     sym = DIR_LABELS[d]
-                    cls = f"hist-chip-{d}"
-                    chips += f'<span class="{cls}">{ind["ticker"]} {sym}</span>'
+                    impact_label, _, kind = impact(ind, d)
+                    cls = f"hist-chip-{kind}"
+                    chips += f'<span class="{cls}">{ind["ticker"]} {sym} {impact_label}</span>'
 
-                note_html = f'<div style="font-size:12px;color:#8b92a8;margin-top:8px;background:#0a0c0f;border:1px solid #1f2535;border-radius:3px;padding:6px 10px">{row["note"]}</div>' if row.get("note") else ""
+                note_html = f'<div style="font-size:14px;color:#b9c5d8;margin-top:8px">{escape(str(row["note"]))}</div>' if row.get("note") else ""
 
-                col1, col2 = st.columns([5, 1])
-                with col1:
+                with st.expander(f"{row['date']} · {row['score']} 点 · {get_regime(row['score'])['name']}"):
                     st.markdown(f"""
                     <div style='background:#111318;border:1px solid #1f2535;border-left:3px solid {regime["color"]};border-radius:4px;padding:12px 16px;margin-bottom:6px'>
                       <div style='display:flex;align-items:center;gap:12px;margin-bottom:10px'>
@@ -357,8 +396,8 @@ def main_app():
                       {note_html}
                     </div>
                     """, unsafe_allow_html=True)
-                with col2:
-                    if st.button("削除", key=f"del_{row['id']}"):
+                    confirm = st.checkbox("この記録を削除する", key=f"confirm_{row['id']}")
+                    if st.button("削除を確定", key=f"del_{row['id']}", disabled=not confirm):
                         if delete_score(row["id"]):
                             st.rerun()
 
